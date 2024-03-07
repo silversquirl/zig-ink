@@ -1,6 +1,8 @@
 # Zig Ink
 
-A runtime for the [Ink narrative scripting language], written in Zig.
+A runtime for the [Ink narrative scripting language][ink], written in Zig.
+
+[ink]: https://www.inklestudios.com/ink/
 
 ## Status
 
