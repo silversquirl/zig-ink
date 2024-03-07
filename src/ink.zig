@@ -75,6 +75,7 @@ pub const Value = union(enum) {
 
     variable: []const u8,
     count: []const u8,
+
     choice: struct {
         target: []const u8,
         flags: packed struct(u5) {
@@ -182,13 +183,20 @@ pub const Value = union(enum) {
 };
 
 pub const Command = enum {
+    // The C# impl mentions G> and G< glue commands as well as <>, but they don't seem to be used and I don't know what they're supposed to do
+    @"<>",
+
+    // This isn't properly documented by the C# impl either
+    @"#",
+    @"/#",
+
     ev,
-    @"/ev",
     out,
+    @"/ev",
+    du,
     pop,
     @"->->",
     @"~ret",
-    du,
     str,
     @"/str",
     nop,
@@ -199,14 +207,13 @@ pub const Command = enum {
     thread,
     done,
     end,
-    @"<>",
 
     @"+",
     @"-",
     @"/",
     @"*",
     @"%",
-    @"_",
+    @"~",
     @"==",
     @">",
     @"<",
