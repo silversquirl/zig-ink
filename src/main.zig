@@ -10,16 +10,18 @@ pub fn main() !void {
     _ = args.skip();
     while (args.next()) |arg| {
         try tty.setColor(out, .bright_cyan);
+        try out.print(" --- Loading {s}...\n", .{arg});
+        try tty.setColor(out, .reset);
 
-        try out.print("Loading {s}\n", .{arg});
-        var f = try std.fs.cwd().openFile(arg, .{});
-        defer f.close();
-
-        const story = try ink.Story.parse(std.heap.page_allocator, f.reader());
+        const story = a: {
+            const f = try std.fs.cwd().openFile(arg, .{});
+            defer f.close();
+            break :a try ink.Story.parse(std.heap.page_allocator, f.reader());
+        };
         defer story.deinit();
 
         try tty.setColor(out, .bright_green);
-        try out.print(" --- Parsed\n", .{});
+        try out.print(" --- Running\n", .{});
         try tty.setColor(out, .reset);
 
         var run: ink.Runner = .{
