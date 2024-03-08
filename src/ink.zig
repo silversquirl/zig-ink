@@ -4,47 +4,6 @@ const log = std.log.scoped(.ink);
 
 pub const ParseError = error{ InvalidInk, OutOfMemory };
 
-pub const Collection = struct {
-    name: []const u8 = "",
-    tracking: packed struct(u3) {
-        visits: bool = false,
-        turns: bool = false,
-        count_start_only: bool = false,
-    } = .{},
-    array: std.MultiArrayList(Value) = .{},
-    dict: std.StringArrayHashMapUnmanaged(Value) = .{},
-
-    pub fn parse(allocator: std.mem.Allocator, json: std.json.Array) ParseError!Collection {
-        var coll: Collection = .{};
-
-        if (json.items.len == 0) {
-            return error.InvalidInk;
-        }
-        for (json.items[0 .. json.items.len - 1]) |val| {
-            try coll.array.append(allocator, try Value.parse(allocator, val));
-        }
-
-        switch (json.items[json.items.len - 1]) {
-            .null => {},
-            .object => |json_dict| for (json_dict.keys(), json_dict.values()) |key, val| {
-                if (std.mem.eql(u8, key, "#n")) {
-                    if (val != .string) return error.InvalidInk;
-                    coll.name = try allocator.dupe(u8, val.string);
-                } else if (std.mem.eql(u8, key, "#f")) {
-                    if (val != .integer) return error.InvalidInk;
-                    const flags: u3 = @intCast(val.integer);
-                    coll.tracking = @bitCast(flags);
-                } else {
-                    try coll.dict.put(allocator, key, try Value.parse(allocator, val));
-                }
-            },
-            else => return error.InvalidInk,
-        }
-
-        return coll;
-    }
-};
-
 // TODO: compact this union
 pub const Value = union(enum) {
     void,
@@ -53,7 +12,7 @@ pub const Value = union(enum) {
     bool: bool,
     int: i64,
     float: f64,
-    collection: Collection,
+    collection: *const Collection,
     divert_target: []const u8,
     pointer: struct {
         varname: []const u8,
@@ -113,7 +72,11 @@ pub const Value = union(enum) {
             .bool => |b| return .{ .bool = b },
             .integer => |i| return .{ .int = i },
             .float => |f| return .{ .float = f },
-            .array => |array| return .{ .collection = try Collection.parse(allocator, array) },
+            .array => |array| {
+                const c = try allocator.create(Collection);
+                c.* = try Collection.parse(allocator, array);
+                return .{ .collection = c };
+            },
 
             // TODO: this is a horrible mess that is begging to be refactored (hint: use an enum)
             .object => |obj| if (try get(.string, obj, "^->")) |target| {
@@ -204,6 +167,7 @@ pub const Command = enum {
     turns,
     visit,
     seq,
+    rnd,
     thread,
     done,
     end,
@@ -225,6 +189,47 @@ pub const Command = enum {
     @"||",
     MIN,
     MAX,
+};
+
+pub const Collection = struct {
+    name: []const u8 = "",
+    tracking: packed struct(u3) {
+        visits: bool = false,
+        turns: bool = false,
+        count_start_only: bool = false,
+    } = .{},
+    array: std.MultiArrayList(Value) = .{},
+    dict: std.StringArrayHashMapUnmanaged(Value) = .{},
+
+    pub fn parse(allocator: std.mem.Allocator, json: std.json.Array) ParseError!Collection {
+        var coll: Collection = .{};
+
+        if (json.items.len == 0) {
+            return error.InvalidInk;
+        }
+        for (json.items[0 .. json.items.len - 1]) |val| {
+            try coll.array.append(allocator, try Value.parse(allocator, val));
+        }
+
+        switch (json.items[json.items.len - 1]) {
+            .null => {},
+            .object => |json_dict| for (json_dict.keys(), json_dict.values()) |key, val| {
+                if (std.mem.eql(u8, key, "#n")) {
+                    if (val != .string) return error.InvalidInk;
+                    coll.name = try allocator.dupe(u8, val.string);
+                } else if (std.mem.eql(u8, key, "#f")) {
+                    if (val != .integer) return error.InvalidInk;
+                    const flags: u3 = @intCast(val.integer);
+                    coll.tracking = @bitCast(flags);
+                } else {
+                    try coll.dict.put(allocator, key, try Value.parse(allocator, val));
+                }
+            },
+            else => return error.InvalidInk,
+        }
+
+        return coll;
+    }
 };
 
 // Get field from json object, with type checking
