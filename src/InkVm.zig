@@ -6,7 +6,9 @@ const InkVm = @This();
 
 // TODO: use a more compact value type for exeuction (NaN tag?)
 stack: std.BoundedArray(ink.Value, 0x1000) = .{},
-states: std.BoundedArray(State, 3) = .{},
+globals: std.StringHashMapUnmanaged(ink.Value) = .{},
+temps: std.StringHashMapUnmanaged(ink.Value) = .{},
+state_stack: std.BoundedArray(State, 0x100) = .{},
 
 const State = union(enum) {
     text: std.ArrayListUnmanaged(u8),
@@ -14,10 +16,10 @@ const State = union(enum) {
     eval,
 };
 fn state(vm: *InkVm) *State {
-    if (vm.states.len == 0) {
-        vm.states.appendAssumeCapacity(.{ .text = .{} });
+    if (vm.state_stack.len == 0) {
+        vm.state_stack.appendAssumeCapacity(.{ .text = .{} });
     }
-    return &vm.states.slice()[vm.states.len - 1];
+    return &vm.state_stack.slice()[vm.state_stack.len - 1];
 }
 
 fn assertState(
@@ -35,21 +37,45 @@ fn assertState(
     };
 }
 
-/// `allocator` must be consistent across calls
-pub fn feed(vm: *InkVm, allocator: std.mem.Allocator, value: ink.Value) !Result {
+fn pushValue(vm: *InkVm, value: ink.Value) !void {
+    vm.stack.append(value) catch return error.StackOverflow;
+}
+fn popValue(vm: *InkVm) !ink.Value {
+    return vm.stack.popOrNull() orelse {
+        return error.InvalidInk; // Stack underflow
+    };
+}
+
+fn getVar(vm: *InkVm, name: []const u8) ?ink.Value {
+    return vm.globals.get(name) orelse vm.temps.get(name);
+}
+
+fn err(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !Result {
+    return .{ .err = try std.fmt.allocPrint(allocator, fmt, args) };
+}
+
+/// Feed a value to the VM
+/// `gpa` is used for long-lived allocations, such as variable values
+/// `arena` is used for anything that is only used as part of the returned `Result`
+pub fn feed(
+    vm: *InkVm,
+    gpa: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    value: ink.Value,
+) !Result {
     switch (value) {
         .string => |s| switch (vm.state().*) {
             .text => |*buf| if (std.mem.endsWith(u8, s, "\n")) {
-                try buf.appendSlice(allocator, s[0 .. s.len - 1]);
-                vm.states.len -= 1;
-                return .{ .text = try buf.toOwnedSlice(allocator) };
+                try buf.appendSlice(arena, s[0 .. s.len - 1]);
+                vm.state_stack.len -= 1;
+                return .{ .text = try buf.toOwnedSlice(arena) };
             } else {
-                try buf.appendSlice(allocator, s);
+                try buf.appendSlice(arena, s);
                 return .more;
             },
 
             .tag => |*buf| {
-                try buf.appendSlice(allocator, s);
+                try buf.appendSlice(arena, s);
                 return .more;
             },
 
@@ -61,13 +87,31 @@ pub fn feed(vm: *InkVm, allocator: std.mem.Allocator, value: ink.Value) !Result 
             return .{ .divert_ptr = c };
         },
 
-        .divert => {
+        .divert => |divert| {
             _ = try vm.assertState(.text);
-            @panic("TODO");
+            if (divert.conditional) {
+                @panic("TODO");
+            }
+            return .{ .divert = .{
+                .target = divert.target,
+                .mode = .normal,
+            } };
         },
-        .divert_var => {
+        .divert_var => |divert| {
             _ = try vm.assertState(.text);
-            @panic("TODO");
+            if (divert.conditional) {
+                @panic("TODO");
+            }
+            const target = vm.getVar(divert.target) orelse {
+                return err(arena, "Undefined variable: {s}", .{divert.target});
+            };
+            if (target != .divert_target) {
+                return err(arena, "Target of variable divert must be a divert target", .{});
+            }
+            return .{ .divert = .{
+                .target = target.divert_target,
+                .mode = .normal,
+            } };
         },
         .divert_func => {
             _ = try vm.assertState(.text);
@@ -78,15 +122,6 @@ pub fn feed(vm: *InkVm, allocator: std.mem.Allocator, value: ink.Value) !Result 
             @panic("TODO");
         },
         .external_call => {
-            _ = try vm.assertState(.text);
-            @panic("TODO");
-        },
-
-        .assign_global => {
-            _ = try vm.assertState(.text);
-            @panic("TODO");
-        },
-        .assign_temp => {
             _ = try vm.assertState(.text);
             @panic("TODO");
         },
@@ -105,18 +140,18 @@ pub fn feed(vm: *InkVm, allocator: std.mem.Allocator, value: ink.Value) !Result 
 
             .@"#" => {
                 _ = try vm.assertState(.text);
-                vm.states.appendAssumeCapacity(.{ .tag = .{} });
+                vm.state_stack.append(.{ .tag = .{} }) catch return error.StackOverflow;
                 return .more;
             },
             .@"/#" => {
                 const buf = try vm.assertState(.tag);
-                vm.states.len -= 1;
-                return .{ .tag = try buf.toOwnedSlice(allocator) };
+                vm.state_stack.len -= 1;
+                return .{ .tag = try buf.toOwnedSlice(arena) };
             },
 
             .ev => {
                 if (vm.state().* == .eval) return error.InvalidInk; // Can't nest eval states
-                vm.states.appendAssumeCapacity(.eval);
+                vm.state_stack.append(.eval) catch return error.StackOverflow;
                 return .more;
             },
             .@"/ev" => {
@@ -124,12 +159,49 @@ pub fn feed(vm: *InkVm, allocator: std.mem.Allocator, value: ink.Value) !Result 
                 @panic("TODO");
             },
 
+            .str => {
+                try vm.assertState(.eval);
+                vm.state_stack.append(.{ .text = .{} }) catch return error.StackOverflow;
+                return .more;
+            },
+            .@"/str" => {
+                const buf = try vm.assertState(.text);
+                if (vm.state_stack.len == 1) {
+                    return error.InvalidInk; // Attempted to exit `str` mode when not in it
+                }
+                defer buf.deinit(arena);
+                vm.state_stack.len -= 1;
+
+                // TODO: would be nice if we didn't have to copy. Not sure that's worth storing the allocator in state though. Maybe just bite the bullet and add a `str` state
+                try vm.pushValue(.{ .string = try gpa.dupe(u8, buf.items) });
+                return .more;
+            },
+
             else => @panic("TODO"),
+        },
+
+        inline .assign_global, .assign_temp => |a, variant| {
+            try vm.assertState(.eval);
+
+            const map = switch (variant) {
+                .assign_global => &vm.globals,
+                .assign_temp => &vm.temps,
+                else => @compileError("unreachable"),
+            };
+
+            const exists = map.get(a.varname) != null;
+            if (a.re != exists) {
+                return error.InvalidInk; // Variable created twice, or not created before assignment
+            }
+
+            try map.put(gpa, a.varname, try vm.popValue());
+
+            return .more;
         },
 
         .void, .bool, .int, .float, .divert_target, .pointer => {
             try vm.assertState(.eval);
-            vm.stack.append(value) catch return error.StackOverflow;
+            try vm.pushValue(value);
             return .more;
         },
         .variable => {
@@ -154,4 +226,6 @@ pub const Result = union(enum) {
         mode: enum { normal, func, tunnel },
     },
     divert_ptr: *const ink.Collection,
+
+    err: []const u8,
 };

@@ -8,16 +8,17 @@ pub const ParseError = error{ InvalidInk, OutOfMemory };
 pub const Value = union(enum) {
     void,
     string: []const u8,
-    command: Command,
     bool: bool,
     int: i64,
     float: f64,
-    collection: *const Collection,
     divert_target: []const u8,
     pointer: struct {
         varname: []const u8,
         const_idx: i64,
     },
+
+    collection: *const Collection,
+    command: Command,
 
     divert: Divert,
     divert_var: Divert,
@@ -55,7 +56,7 @@ pub const Value = union(enum) {
         re: bool,
     };
 
-    pub fn parse(allocator: std.mem.Allocator, json: std.json.Value) ParseError!Value {
+    pub fn parse(allocator: std.mem.Allocator, parent: *Collection, json: std.json.Value) ParseError!Value {
         switch (json) {
             .string => |s| if (std.mem.eql(u8, s, "void")) {
                 return .void;
@@ -73,9 +74,7 @@ pub const Value = union(enum) {
             .integer => |i| return .{ .int = i },
             .float => |f| return .{ .float = f },
             .array => |array| {
-                const c = try allocator.create(Collection);
-                c.* = try Collection.parse(allocator, array);
-                return .{ .collection = c };
+                return .{ .collection = try Collection.parse(allocator, parent, array) };
             },
 
             // TODO: this is a horrible mess that is begging to be refactored (hint: use an enum)
@@ -200,15 +199,17 @@ pub const Collection = struct {
     } = .{},
     array: std.MultiArrayList(Value) = .{},
     dict: std.StringArrayHashMapUnmanaged(Value) = .{},
+    parent: ?*const Collection,
 
-    pub fn parse(allocator: std.mem.Allocator, json: std.json.Array) ParseError!Collection {
-        var coll: Collection = .{};
+    pub fn parse(allocator: std.mem.Allocator, parent: ?*Collection, json: std.json.Array) ParseError!*const Collection {
+        const coll = try allocator.create(Collection);
+        coll.* = .{ .parent = parent };
 
         if (json.items.len == 0) {
             return error.InvalidInk;
         }
         for (json.items[0 .. json.items.len - 1]) |val| {
-            try coll.array.append(allocator, try Value.parse(allocator, val));
+            try coll.array.append(allocator, try Value.parse(allocator, coll, val));
         }
 
         switch (json.items[json.items.len - 1]) {
@@ -222,10 +223,20 @@ pub const Collection = struct {
                     const flags: u3 = @intCast(val.integer);
                     coll.tracking = @bitCast(flags);
                 } else {
-                    try coll.dict.put(allocator, key, try Value.parse(allocator, val));
+                    try coll.dict.put(
+                        allocator,
+                        try allocator.dupe(u8, key),
+                        try Value.parse(allocator, coll, val),
+                    );
                 }
             },
             else => return error.InvalidInk,
+        }
+
+        if (coll.name.len > 0) {
+            if (parent) |p| {
+                try p.dict.put(allocator, coll.name, .{ .collection = coll });
+            }
         }
 
         return coll;

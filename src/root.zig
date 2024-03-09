@@ -1,5 +1,6 @@
 //! User-facing API
 const std = @import("std");
+const log = std.log.scoped(.ink);
 
 const ink = @import("ink.zig");
 const InkVm = @import("InkVm.zig");
@@ -8,7 +9,7 @@ pub const max_ink_version = 21;
 
 pub const Story = struct {
     arena: std.heap.ArenaAllocator,
-    root: ink.Collection,
+    root: *const ink.Collection,
 
     pub fn deinit(story: Story) void {
         story.arena.deinit();
@@ -41,7 +42,7 @@ pub const Story = struct {
         errdefer arena.deinit();
 
         const root_json = try ink.get(.array, file.object, "root") orelse return error.InvalidInk;
-        const root = try ink.Collection.parse(arena.allocator(), root_json);
+        const root = try ink.Collection.parse(arena.allocator(), null, root_json);
 
         return Story{
             .arena = arena,
@@ -54,6 +55,7 @@ pub const Runner = struct {
     allocator: std.mem.Allocator,
     story: *const Story,
     ended: bool = false,
+    error_msg: ?[]const u8 = null, // Will be populated iff `next` returned `error.Ink`
 
     vm: InkVm = .{},
     current: ?*const ink.Collection = null,
@@ -67,15 +69,28 @@ pub const Runner = struct {
         _ = arena.reset(.{ .retain_with_limit = 0x4000 }); // TODO: check to make sure this limit is reasonable
         defer run.arena = arena.state;
 
+        run.error_msg = null;
+
         var tags = std.ArrayList([]const u8).init(arena.allocator());
-        while (true) {
-            const cur = run.current orelse &run.story.root;
+        loop: while (true) {
+            var cur = run.current orelse run.story.root;
             if (run.idx >= cur.array.len) {
-                return error.InvalidInk;
+                if (cur.parent) |p| {
+                    // FIXME: slow
+                    for (p.array.items(.tags), p.array.items(.data), 0..) |tag, data, i| {
+                        if (tag == .collection and data.collection == cur) {
+                            run.idx = i + 1;
+                            run.current = p;
+                            continue :loop;
+                        }
+                    }
+                }
+                return error.InvalidInk; // Reached end of collection with no way to continue
             }
+
             const val = cur.array.get(run.idx);
             run.idx += 1;
-            switch (try run.vm.feed(arena.allocator(), val)) {
+            switch (try run.vm.feed(run.allocator, arena.allocator(), val)) {
                 .more => {},
                 .end => {
                     run.ended = true;
@@ -89,11 +104,43 @@ pub const Runner = struct {
                 },
                 .choice => @panic("TODO"),
 
-                .divert => @panic("TODO"),
+                .divert => |divert| {
+                    var path = divert.target;
+                    var coll = run.story.root;
+                    if (std.mem.startsWith(u8, path, ".^.")) {
+                        coll = cur;
+                        path = path[".^.".len..];
+                    }
+                    var it = std.mem.splitScalar(u8, path, '.');
+                    while (it.next()) |part| {
+                        if (std.mem.eql(u8, part, "^")) {
+                            coll = coll.parent orelse {
+                                return error.InvalidInk; // Tried to get parent of root collection
+                            };
+                        } else {
+                            const value = if (std.fmt.parseInt(usize, part, 10)) |idx|
+                                coll.array.get(idx)
+                            else |_|
+                                coll.dict.get(part) orelse {
+                                    log.err("Can't find divert target: '{s}' (in path {s})", .{ part, divert.target });
+                                    return error.InvalidInk; // Invalid divert target
+                                };
+                            if (value != .collection) {
+                                return error.InvalidInk; // Divert non-collection
+                            }
+                            coll = value.collection;
+                        }
+                    }
+
+                    run.current = coll;
+                    run.idx = 0;
+                },
                 .divert_ptr => |ptr| {
                     run.current = ptr;
                     run.idx = 0;
                 },
+
+                .err => |msg| run.error_msg = msg,
             }
         }
     }
