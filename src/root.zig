@@ -57,12 +57,14 @@ pub const Runner = struct {
     ended: bool = false,
     error_msg: ?[]const u8 = null, // Will be populated iff `next` returned `error.Ink`
 
+    choice: bool = false,
     vm: InkVm = .{},
     current: ?*const ink.Collection = null,
     idx: usize = 0,
     arena: std.heap.ArenaAllocator.State = .{},
 
-    pub fn next(run: *Runner) !?Content {
+    pub fn next(run: *Runner) !?Chunk {
+        std.debug.assert(!run.choice); // Continued without selecting a choice
         if (run.ended) return null;
 
         var arena = run.arena.promote(run.allocator);
@@ -71,9 +73,10 @@ pub const Runner = struct {
 
         run.error_msg = null;
 
+        var choices: Chunk.Choices = .{};
         var tags = std.ArrayList([]const u8).init(arena.allocator());
         loop: while (true) {
-            var cur = run.current orelse run.story.root;
+            const cur = run.current orelse run.story.root;
             if (run.idx >= cur.array.len) {
                 if (cur.parent) |p| {
                     // FIXME: slow
@@ -89,7 +92,12 @@ pub const Runner = struct {
             }
 
             const val = cur.array.get(run.idx);
+            if (val == .command and val.command == .done and choices.len > 0) {
+                run.choice = true;
+                return .{ .choices = choices };
+            }
             run.idx += 1;
+
             switch (try run.vm.feed(run.allocator, arena.allocator(), val)) {
                 .more => {},
                 .end => {
@@ -98,42 +106,29 @@ pub const Runner = struct {
                 },
 
                 .tag => |tag| try tags.append(tag),
-                .text => |text| return .{
-                    .text = text,
-                    .tags = try tags.toOwnedSlice(),
+                .text => |text| {
+                    if (choices.len > 0) return error.InvalidInk; // Text after choices
+                    return .{ .text = .{
+                        .text = text,
+                        .tags = try tags.toOwnedSlice(),
+                    } };
                 },
-                .choice => @panic("TODO"),
+
+                .choice => |choice| {
+                    try choices.append(arena.allocator(), .{
+                        .choice = .{
+                            .text = choice.text,
+                            .tags = try tags.toOwnedSlice(),
+                        },
+                        .target = choice.target,
+                    });
+                },
 
                 .divert => |divert| {
-                    var path = divert.target;
-                    var coll = run.story.root;
-                    if (std.mem.startsWith(u8, path, ".^.")) {
-                        coll = cur;
-                        path = path[".^.".len..];
+                    if (divert.mode != .normal) {
+                        @panic("TODO");
                     }
-                    var it = std.mem.splitScalar(u8, path, '.');
-                    while (it.next()) |part| {
-                        if (std.mem.eql(u8, part, "^")) {
-                            coll = coll.parent orelse {
-                                return error.InvalidInk; // Tried to get parent of root collection
-                            };
-                        } else {
-                            const value = if (std.fmt.parseInt(usize, part, 10)) |idx|
-                                coll.array.get(idx)
-                            else |_|
-                                coll.dict.get(part) orelse {
-                                    log.err("Can't find divert target: '{s}' (in path {s})", .{ part, divert.target });
-                                    return error.InvalidInk; // Invalid divert target
-                                };
-                            if (value != .collection) {
-                                return error.InvalidInk; // Divert non-collection
-                            }
-                            coll = value.collection;
-                        }
-                    }
-
-                    run.current = coll;
-                    run.idx = 0;
+                    try run.go(divert.target);
                 },
                 .divert_ptr => |ptr| {
                     run.current = ptr;
@@ -145,14 +140,37 @@ pub const Runner = struct {
         }
     }
 
-    pub fn choices(run: Runner) ?[]Content {
-        _ = run;
-        @compileError("TODO");
-    }
+    pub fn go(run: *Runner, target_path: []const u8) !void {
+        var path = target_path;
+        var coll = run.story.root;
+        if (std.mem.startsWith(u8, path, ".^.")) {
+            if (run.current) |c| coll = c;
+            path = path[".^.".len..];
+        }
+        var it = std.mem.splitScalar(u8, path, '.');
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part, "^")) {
+                coll = coll.parent orelse {
+                    return error.InvalidInk; // Tried to get parent of root collection
+                };
+            } else {
+                const value = if (std.fmt.parseInt(usize, part, 10)) |idx|
+                    coll.array.get(idx)
+                else |_|
+                    coll.dict.get(part) orelse {
+                        log.err("Can't find divert target: '{s}' (in path {s})", .{ part, path });
+                        return error.InvalidInk; // Invalid divert target
+                    };
+                if (value != .collection) {
+                    return error.InvalidInk; // Divert non-collection
+                }
+                coll = value.collection;
+            }
+        }
 
-    pub fn choosePathString(run: Runner, path: []const u8) void {
-        _ = .{ run, path };
-        @compileError("TODO");
+        run.current = coll;
+        run.idx = 0;
+        run.choice = false;
     }
 
     pub const ExecError = error{
@@ -163,6 +181,15 @@ pub const Runner = struct {
     };
 };
 
+pub const Chunk = union(enum) {
+    text: Content,
+    choices: Choices,
+
+    pub const Choices = std.MultiArrayList(struct {
+        choice: Content,
+        target: []const u8,
+    });
+};
 pub const Content = struct {
     text: []const u8,
     tags: []const []const u8,

@@ -1,5 +1,6 @@
 //! Ink virtual machine
 const std = @import("std");
+const log = std.log.scoped(.ink);
 const ink = @import("ink.zig");
 
 const InkVm = @This();
@@ -126,15 +127,47 @@ pub fn feed(
             @panic("TODO");
         },
 
-        .choice => {
-            _ = try vm.assertState(.text);
-            @panic("TODO");
+        .choice => |choice| {
+            const buf = try vm.assertState(.text);
+            if (buf.items.len != 0) {
+                return error.InvalidInk; // Can't have choice and text at the same time
+            }
+
+            if (choice.flags.has_condition or choice.flags.is_invisible_default or choice.flags.once_only) {
+                @panic("TODO");
+            }
+
+            const start = if (choice.flags.has_start_content) a: {
+                const text = try vm.popValue();
+                if (text != .string) return error.InvalidInk; // Must be a string
+                break :a text;
+            } else null;
+            defer if (start) |s| gpa.free(s.string);
+
+            if (choice.flags.has_choice_only_content) {
+                const text = try vm.popValue();
+                if (text != .string) return error.InvalidInk; // Must be a string
+                defer gpa.free(text.string);
+                try buf.appendSlice(arena, text.string);
+            }
+            if (start) |s| {
+                try buf.appendSlice(arena, s.string);
+            }
+
+            return .{ .choice = .{
+                .text = try buf.toOwnedSlice(arena),
+                .target = choice.target,
+            } };
         },
 
         .command => |cmd| switch (cmd) {
-            // TODO: warn when `done` without `end`
-            .end, .done => {
+            .end => {
                 _ = try vm.assertState(.text);
+                return .end;
+            },
+            .done => {
+                _ = try vm.assertState(.text);
+                log.warn("script ends early", .{});
                 return .end;
             },
 
@@ -156,7 +189,9 @@ pub fn feed(
             },
             .@"/ev" => {
                 try vm.assertState(.eval);
-                @panic("TODO");
+                vm.state_stack.len -= 1;
+                // TODO: do we need to clear the stack?
+                return .more;
             },
 
             .str => {
@@ -181,8 +216,6 @@ pub fn feed(
         },
 
         inline .assign_global, .assign_temp => |a, variant| {
-            try vm.assertState(.eval);
-
             const map = switch (variant) {
                 .assign_global => &vm.globals,
                 .assign_temp => &vm.temps,
@@ -191,7 +224,8 @@ pub fn feed(
 
             const exists = map.get(a.varname) != null;
             if (a.re != exists) {
-                return error.InvalidInk; // Variable created twice, or not created before assignment
+                // TODO: re-enable this once I actually clear out temporaries properly
+                //return error.InvalidInk; // Variable created twice, or not created before assignment
             }
 
             try map.put(gpa, a.varname, try vm.popValue());
@@ -220,7 +254,10 @@ pub const Result = union(enum) {
     end,
     tag: []const u8,
     text: []const u8,
-    choice: []const u8,
+    choice: struct {
+        text: []const u8,
+        target: []const u8,
+    },
     divert: struct {
         target: []const u8,
         mode: enum { normal, func, tunnel },
